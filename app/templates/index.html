@@ -63,8 +63,148 @@
   </div>
 </section>
 
+<section class="card" id="retests">
+  <h2>2. 复测订正（迟到复测 / 撤回）</h2>
+  <p class="hint">
+    上传样本编号、修订号、状态与四项元素含量的 CSV。状态为
+    <b>生效</b>或<b>撤回</b>；撤回行不填含量，生效行四项含量都必须填写；
+    <b>同一文件中样本编号不能重复</b>。每个样本按修订号推进：
+    原样重投不会重复生效；迟到的旧修订号若从未送达、
+    同一修订号内容不同、或同一文件内样本重复，都会<b>整批拒收</b>；
+    更高的修订号可以恢复已撤回的复测。<b>订正绑定提交时的成品输入版本</b>：
+    若上传期间成品输入已被替换，本次订正整批失败。
+    原始成品 CSV 与已发布的占比报告不会被改写。
+  </p>
+
+  <form method="post" action="/retests/upload" enctype="multipart/form-data" class="upload-form">
+    <div class="upload-grid">
+      <label class="upload-box">
+        <span class="upload-title">复测 CSV（样本编号 × 修订号 × 状态 × 四项元素）</span>
+        <span class="upload-example">sample_id,revision,status,Fe,SiO2,Al2O3,CaO<br>S-1001,1,生效,62.71,3.70,2.02,1.12<br>S-1002,2,撤回,,,,</span>
+        <input type="file" name="retest_file" accept=".csv,text/csv">
+      </label>
+    </div>
+    <div class="actions">
+      <button type="submit" class="primary" {% if not current.samples %}disabled{% endif %}>上传并应用复测订正</button>
+      <span class="hint">必须先上传成品输入；元素列按名称与当前成品匹配。</span>
+    </div>
+    {% if current.samples %}
+      {# Bind the batch to the version the clerk saw on screen.  If the
+         samples input is replaced before this form is submitted, the
+         server rejects the whole batch instead of applying it to different
+         samples. #}
+      <input type="hidden" name="samples_version" value="{{ current.samples.version }}">
+    {% endif %}
+  </form>
+
+  {% if not current.samples %}
+    <p class="empty">尚未上传成品 CSV，无法绑定复测订正版本。</p>
+  {% elif retests %}
+    <div class="review-head">
+      <p class="meta">
+        当前成品 v{{ retests.samples_version }}
+        {% if retests.filename %} · {{ retests.filename }}{% endif %} ·
+        生效订正 {{ retests.corrected_count }} 个 · 撤回 {{ retests.withdrawn_count }} 个 ·
+        存在差异 {{ retests.changed_count }} 个 · 需复核 {{ retests.needs_review_count }} 个 ·
+        <a href="/retests/export.csv">导出复测核对 CSV</a>
+      </p>
+      {% if retests.other_version_revisions %}
+        <div class="notice notice-warn">
+          另有 {{ retests.other_version_revisions }} 条复测记录绑定在<b>其他成品版本</b>上，
+          已按版本隔离，不会混入当前 v{{ retests.samples_version }} 的核对表。
+        </div>
+      {% endif %}
+      {% if retests.report_available and not retests.report_on_same_version %}
+        <div class="notice notice-warn">
+          当前占比报告引用的是成品 v{{ retests.report_version }}，
+          与当前成品 v{{ retests.samples_version }} 不同。
+          本次复测订正<b>不能</b>归因于该报告中的样本差异；请在当前版本上重新计算报告。
+        </div>
+      {% elif not retests.report_available %}
+        <div class="notice notice-warn">
+          尚未发布占比报告，无法判断哪些样本需要复核；发布报告后会在下表标出。
+        </div>
+      {% endif %}
+    </div>
+
+    <div class="table-scroll">
+      <table class="report-table retest-table">
+        <thead>
+          <tr>
+            <th rowspan="2">样本编号</th>
+            <th rowspan="2">最新修订</th>
+            <th rowspan="2">复测状态</th>
+            {% for e in retests.elements %}
+              <th colspan="3">{{ e }}</th>
+            {% endfor %}
+            <th rowspan="2">复核</th>
+          </tr>
+          <tr>
+            {% for e in retests.elements %}
+              <th>原值</th><th>有效复测</th><th>差异</th>
+            {% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in retests.rows %}
+          <tr class="{% if row.needs_review %}row-review{% elif row.withdrawn %}row-withdrawn{% endif %}">
+            <td class="sample-id">{{ row.sample_id }}</td>
+            <td class="num-cell">{{ row.latest_revision if row.latest_revision is not none else "—" }}</td>
+            <td>
+              {% if row.withdrawn %}
+                <span class="badge badge-warn">已撤回</span>
+              {% elif row.correction %}
+                <span class="badge badge-fresh">生效</span>
+              {% else %}
+                <span class="badge badge-stale">无复测</span>
+              {% endif %}
+            </td>
+            {% if row.withdrawn %}
+              {# Original values stay visible; a single merged cell states
+                 that the withdrawn retest contributes no effective value. #}
+              {% for i in range(retests.elements|length) %}
+                <td class="num-cell">{{ row.original[i] }}</td>
+              {% endfor %}
+              <td class="num-cell withdrawn-cell" colspan="{{ 2 * (retests.elements|length) }}">
+                撤回：无有效复测值，核对以原值为准
+              </td>
+            {% else %}
+              {% for i in range(retests.elements|length) %}
+                <td class="num-cell">{{ row.original[i] }}</td>
+                {% if row.effective %}
+                  <td class="num-cell">{{ row.effective[i] }}</td>
+                  <td class="num-cell residual">{{ row.differences[i] }}</td>
+                {% else %}
+                  <td class="num-cell">—</td><td class="num-cell">—</td>
+                {% endif %}
+              {% endfor %}
+            {% endif %}
+            <td>
+              {% if row.needs_review %}
+                <span class="badge badge-warn" title="报告引用同一成品版本，且有效复测与原值不同">需复核</span>
+              {% elif row.changed and retests.report_available %}
+                <span class="badge badge-stale" title="有效复测与原值不同，但当前报告版本不同，不能归因于本次复测">差异（报告版本不同）</span>
+              {% elif row.changed %}
+                <span class="badge badge-stale" title="有效复测与原值不同，但尚无引用该版本的报告">差异（尚无同版本报告）</span>
+              {% else %}
+                <span class="hint">—</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="hint">
+      “差异”= 有效复测值 − 原值（逐元素，精确有理数计算后显示）。
+      只有当前占比报告引用的成品版本与上表版本一致，且某样本存在差异时，
+      才会标出“需复核”；版本不同时不会把差异归因于本次复测。
+    </p>
+  {% endif %}
+</section>
+
 <section class="card" id="compute">
-  <h2>2. 计算占比</h2>
+  <h2>3. 计算占比</h2>
   <p class="hint">
     对每个样本，在“三项占比非负且总和为 1”的约束下最小化四项元素加权预测含量与实测值的
     平方误差和（SSE）。若存在多组同样最优的占比，报告只会标记<b>无法唯一确定</b>并给出
@@ -81,7 +221,7 @@
 </section>
 
 <section class="card" id="report">
-  <h2>3. 报告</h2>
+  <h2>4. 报告</h2>
   {% if not report %}
     <p class="empty">尚无报告。上传输入后点击“计算”。</p>
   {% else %}

@@ -10,6 +10,12 @@ Two tables carry the whole state:
   re-checks that the snapshot versions are still current *inside* the same
   ``BEGIN IMMEDIATE`` transaction that writes the report, which is what
   makes publishing safe when an upload interleaves with a calculation.
+* ``retest_batches`` / ``retest_revisions`` – append-only late retest
+  corrections, each bound to the *samples input version* current at upload
+  time.  Applying a batch re-checks that binding inside the write
+  transaction; a batch submitted while the samples input is being replaced
+  therefore fails as a whole.  ``(samples_version, sample_id, revision)``
+  is unique, so one revision can never be recorded twice for one version.
 
 All writes from this process are serialised by a re-entrant lock; SQLite's
 own locking covers other processes/workers.
@@ -25,6 +31,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+from .inputs import fraction_to_text
+from .retests import (
+    RetestBatchResult,
+    RetestConflictError,
+    RetestRevision,
+    RetestStaleVersionError,
+    plan_retests,
+)
 
 KINDS = ("baseline", "samples")
 
@@ -65,6 +80,29 @@ class ReportRecord:
     @property
     def is_stale(self) -> bool:
         return not (self.baseline_is_current and self.samples_is_current)
+
+
+@dataclass(frozen=True)
+class ReviewState:
+    """Consistent snapshot used by the review page.
+
+    Everything comes from one read transaction: the current inputs, the
+    retest history bound to the current samples version, and the latest
+    report.  The page therefore cannot combine a just-committed retest
+    batch with a newer input or an older report.
+    """
+
+    current: dict[str, "VersionedInput | None"]
+    revisions: list[RetestRevision]
+    report: "ReportRecord | None"
+    # Revisions recorded against a *different* samples version.  They are
+    # deliberately excluded from the review; this count lets the page say
+    # so instead of silently pretending they do not exist.
+    other_version_revisions: int = 0
+
+    @property
+    def samples(self) -> "VersionedInput | None":
+        return self.current["samples"]
 
 
 class Store:
@@ -119,6 +157,35 @@ class Store:
                         payload           TEXT    NOT NULL,
                         created_at        TEXT    NOT NULL
                     );
+
+                    CREATE TABLE IF NOT EXISTS retest_batches (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        samples_version INTEGER NOT NULL
+                                        REFERENCES input_versions (id),
+                        filename        TEXT,
+                        rows_total      INTEGER NOT NULL,
+                        rows_applied    INTEGER NOT NULL,
+                        rows_replayed   INTEGER NOT NULL,
+                        created_at      TEXT    NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS retest_revisions (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        batch_id        INTEGER NOT NULL
+                                        REFERENCES retest_batches (id),
+                        samples_version INTEGER NOT NULL
+                                        REFERENCES input_versions (id),
+                        sample_id       TEXT    NOT NULL,
+                        revision        INTEGER NOT NULL CHECK (revision >= 1),
+                        status          TEXT    NOT NULL
+                                        CHECK (status IN ('生效', '撤回')),
+                        values_json     TEXT,
+                        created_at      TEXT    NOT NULL,
+                        UNIQUE (samples_version, sample_id, revision)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS retest_revisions_by_version
+                    ON retest_revisions (samples_version);
                     """
                 )
             except sqlite3.Error as exc:
@@ -351,3 +418,170 @@ class Store:
             == row["baseline_version"],
             samples_is_current=row["current_samples"] == row["samples_version"],
         )
+
+    # -- retest corrections ---------------------------------------------
+
+    @staticmethod
+    def _retest_rows(
+        conn: sqlite3.Connection, samples_version: int
+    ) -> list[RetestRevision]:
+        rows = conn.execute(
+            "SELECT batch_id, samples_version, sample_id, revision, status, "
+            "       values_json, created_at "
+            "FROM retest_revisions WHERE samples_version = ? "
+            "ORDER BY sample_id, revision",
+            (samples_version,),
+        ).fetchall()
+        return [RetestRevision.from_row(row) for row in rows]
+
+    def retest_history(
+        self, samples_version: int
+    ) -> list[RetestRevision]:
+        """All recorded revisions for one samples version, oldest first.
+
+        Retests are keyed by samples version, so a different (e.g. newer)
+        samples input can never see or inherit them.
+        """
+
+        with self._read() as conn:
+            return self._retest_rows(conn, samples_version)
+
+    def review_state(self) -> "ReviewState":
+        """One consistent read for the retest review page.
+
+        Returns the current samples input, the retest history bound to it,
+        and the latest report record, all from the same read transaction so
+        the page cannot mix a committed retest batch with a newer input.
+        """
+
+        with self._read() as conn:
+            current: dict[str, VersionedInput | None] = {}
+            for kind in KINDS:
+                row = self._current_row(conn, kind)
+                current[kind] = self._row_to_input(row) if row else None
+            samples = current["samples"]
+            revisions = (
+                self._retest_rows(conn, samples.version_id) if samples else []
+            )
+            report_row = conn.execute(
+                "SELECT r.id, r.baseline_version, r.samples_version, "
+                "       r.payload, r.created_at, "
+                "       (SELECT id FROM input_versions "
+                "         WHERE kind = 'baseline' AND is_current = 1) "
+                "         AS current_baseline, "
+                "       (SELECT id FROM input_versions "
+                "         WHERE kind = 'samples' AND is_current = 1) "
+                "         AS current_samples "
+                "FROM reports r ORDER BY r.id DESC LIMIT 1"
+            ).fetchone()
+            report = self._row_to_report(report_row) if report_row else None
+            other = (
+                conn.execute(
+                    "SELECT COUNT(*) FROM retest_revisions "
+                    "WHERE samples_version != ?",
+                    (samples.version_id,),
+                ).fetchone()[0]
+                if samples
+                else conn.execute(
+                    "SELECT COUNT(*) FROM retest_revisions"
+                ).fetchone()[0]
+            )
+            return ReviewState(
+                current=current,
+                revisions=revisions,
+                report=report,
+                other_version_revisions=int(other),
+            )
+
+    def apply_retests(
+        self,
+        samples_version: int,
+        rows: Sequence[Any],
+        filename: str | None,
+    ) -> RetestBatchResult:
+        """Apply one retest batch atomically, or apply nothing at all.
+
+        The check that ``samples_version`` is still the current samples
+        input happens inside the same ``BEGIN IMMEDIATE`` transaction that
+        writes the batch, so a samples upload racing this call makes the
+        whole batch fail with :class:`RetestStaleVersionError`.
+        """
+
+        def encode(row: Any) -> str | None:
+            if row.values is None:
+                return None
+            return json.dumps(
+                [fraction_to_text(value) for value in row.values],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+        now = _utcnow()
+        try:
+            with self._write() as conn:
+                current = conn.execute(
+                    "SELECT id FROM input_versions "
+                    "WHERE kind = 'samples' AND is_current = 1"
+                ).fetchone()
+                if current is None or current["id"] != samples_version:
+                    raise RetestStaleVersionError(
+                        "提交期间成品输入已被替换；本次复测订正已整批拒绝，"
+                        "此前有效的复测记录保持不变"
+                    )
+
+                history = self._retest_rows(conn, samples_version)
+                grouped: dict[str, list[RetestRevision]] = {}
+                for revision in history:
+                    grouped.setdefault(revision.sample_id, []).append(revision)
+                plan = plan_retests(grouped, rows)
+
+                if not plan.new_revisions:
+                    # An all-replay batch is a success but writes nothing.
+                    return RetestBatchResult(
+                        batch_id=0,
+                        samples_version=samples_version,
+                        applied=0,
+                        replayed=plan.replayed,
+                    )
+
+                cursor = conn.execute(
+                    "INSERT INTO retest_batches "
+                    "(samples_version, filename, rows_total, rows_applied, "
+                    " rows_replayed, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        samples_version,
+                        filename,
+                        len(rows),
+                        len(plan.new_revisions),
+                        plan.replayed,
+                        now,
+                    ),
+                )
+                batch_id = int(cursor.lastrowid)
+                for row in plan.new_revisions:
+                    conn.execute(
+                        "INSERT INTO retest_revisions "
+                        "(batch_id, samples_version, sample_id, revision, "
+                        " status, values_json, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            batch_id,
+                            samples_version,
+                            row.sample_id,
+                            row.revision,
+                            row.status,
+                            encode(row),
+                            now,
+                        ),
+                    )
+                return RetestBatchResult(
+                    batch_id=batch_id,
+                    samples_version=samples_version,
+                    applied=len(plan.new_revisions),
+                    replayed=plan.replayed,
+                )
+        except (RetestConflictError, RetestStaleVersionError):
+            raise
+        except sqlite3.Error as exc:
+            raise StoreError(f"保存复测失败：{exc}") from exc

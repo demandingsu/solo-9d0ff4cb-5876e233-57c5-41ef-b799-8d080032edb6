@@ -215,6 +215,12 @@ button.primary:disabled { background: #a8bcc5; cursor: not-allowed; }
 .range { color: var(--warn); font-size: 12.5px; }
 .unit { color: var(--muted); font-size: 11px; margin-left: 1px; }
 
+.review-head { margin: 16px 0 6px; }
+.review-head .notice { margin-top: 10px; }
+.retest-table tbody tr.row-review { background: #fff6e5; }
+.retest-table tbody tr.row-withdrawn { background: #f4f6f8; color: var(--muted); }
+.withdrawn-cell { font-style: italic; color: var(--muted); }
+
 .footer { color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); padding-top: 14px; }
 
 @media (max-width: 640px) {

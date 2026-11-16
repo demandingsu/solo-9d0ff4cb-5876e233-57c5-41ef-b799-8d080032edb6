@@ -21,6 +21,19 @@ samples.csv::
 Exactly three ore rows / four element columns are required for the
 baseline.  Sample element labels are matched to the baseline by name at
 calculation time.
+
+Retest correction uploads (``retests.csv``) carry three identity columns
+followed by the four element columns::
+
+    sample_id,revision,status,Fe,SiO2,Al2O3,CaO
+    S-1001,1,生效,62.71,3.70,2.02,1.12
+    S-1002,2,撤回,,,
+
+``status`` is ``生效`` or ``撤回``.  A withdrawal carries no amounts; an
+effective row must carry all four.  The first three header labels are
+free-form (the columns are positional), while the element labels are
+matched to the currently submitted samples input by name.  A sample may
+appear at most once per file.
 """
 
 from __future__ import annotations
@@ -39,8 +52,16 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 # report serialisation.
 MAX_ADJUSTED_EXPONENT = 100
 MAX_SAMPLES = 2000
+MAX_RETEST_ROWS = 2000
 ELEMENT_COUNT = 4
 ORE_COUNT = 3
+RETEST_FIXED_COLUMNS = 3  # sample id, revision, status
+RETEST_STATUS_EFFECTIVE = "生效"
+RETEST_STATUS_WITHDRAWN = "撤回"
+RETEST_STATUSES = (RETEST_STATUS_EFFECTIVE, RETEST_STATUS_WITHDRAWN)
+# SQLite INTEGER is signed 64-bit; keeping revisions far below that also
+# keeps the stored numbers readable.
+MAX_RETEST_REVISION = 2**31 - 1
 
 _NUMBER_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
 
@@ -275,3 +296,120 @@ def parse_samples(raw: bytes) -> SamplesInput:
         sample_ids=tuple(sample_ids),
         rows=tuple(parsed_rows),
     )
+
+
+@dataclass(frozen=True)
+class RetestRow:
+    sample_id: str
+    revision: int
+    status: str  # RETEST_STATUS_EFFECTIVE or RETEST_STATUS_WITHDRAWN
+    values: tuple[Fraction, ...] | None  # None for a withdrawal
+    line_no: int = 0
+
+    @property
+    def is_withdrawal(self) -> bool:
+        return self.status == RETEST_STATUS_WITHDRAWN
+
+
+@dataclass(frozen=True)
+class RetestInput:
+    elements: tuple[str, ...]
+    rows: tuple[RetestRow, ...]
+
+
+def parse_retests(raw: bytes) -> RetestInput:
+    """Parse one retest-correction CSV.
+
+    All structural checks happen here; matching the element labels against
+    the submitted samples input happens when the batch is applied.
+    """
+
+    rows = _read_rows(raw, "复测")
+    line_no, raw_header = rows[0]
+    expected_columns = RETEST_FIXED_COLUMNS + ELEMENT_COUNT
+    if len(raw_header) != expected_columns:
+        raise InputValidationError(
+            f"复测表头必须有 {expected_columns} 列"
+            f"（样本编号、修订号、状态 + {ELEMENT_COUNT} 个元素列），"
+            f"实际 {len(raw_header)} 列"
+        )
+    header = [cell.strip() for cell in raw_header]
+    if any(not cell for cell in header):
+        raise InputValidationError(f"第 {line_no} 行：表头存在空列名")
+    if len(set(header)) != len(header):
+        raise InputValidationError(f"第 {line_no} 行：表头列名不能重复")
+    elements = tuple(header[RETEST_FIXED_COLUMNS:])
+
+    data: list[tuple[int, list[str]]] = []
+    for data_line, row in rows[1:]:
+        if len(row) != expected_columns:
+            raise InputValidationError(
+                f"第 {data_line} 行：应有 {expected_columns} 列，"
+                f"实际 {len(row)} 列"
+            )
+        data.append((data_line, [cell.strip() for cell in row]))
+    if not data:
+        raise InputValidationError("复测文件没有数据行")
+    if len(data) > MAX_RETEST_ROWS:
+        raise InputValidationError(
+            f"复测 CSV 最多支持 {MAX_RETEST_ROWS} 行，实际 {len(data)} 行"
+        )
+
+    parsed: list[RetestRow] = []
+    seen: dict[str, int] = {}
+    for data_line, row in data:
+        sample_id, revision_text, status = row[0], row[1], row[2]
+        if not sample_id:
+            raise InputValidationError(f"第 {data_line} 行：样本编号不能为空")
+        if sample_id in seen:
+            raise InputValidationError(
+                f"第 {data_line} 行：样本编号“{sample_id}”在同一文件中重复"
+                f"（首次出现在第 {seen[sample_id]} 行）"
+            )
+        seen[sample_id] = data_line
+        if not re.fullmatch(r"[0-9]+", revision_text):
+            raise InputValidationError(
+                f"第 {data_line} 行：修订号必须是正整数，实际为 {_shown(revision_text)}"
+            )
+        if len(revision_text) > 10:
+            raise InputValidationError(
+                f"第 {data_line} 行：修订号过大（上限 {MAX_RETEST_REVISION}）"
+            )
+        revision = int(revision_text)
+        if revision < 1:
+            raise InputValidationError(
+                f"第 {data_line} 行：修订号必须从 1 开始，实际为 {revision}"
+            )
+        if revision > MAX_RETEST_REVISION:
+            raise InputValidationError(
+                f"第 {data_line} 行：修订号过大（上限 {MAX_RETEST_REVISION}）"
+            )
+        if status not in RETEST_STATUSES:
+            raise InputValidationError(
+                f"第 {data_line} 行：状态只能是“{RETEST_STATUS_EFFECTIVE}”"
+                f"或“{RETEST_STATUS_WITHDRAWN}”，实际为 {_shown(status)}"
+            )
+
+        raw_values = row[RETEST_FIXED_COLUMNS:]
+        if status == RETEST_STATUS_WITHDRAWN:
+            if any(value for value in raw_values):
+                raise InputValidationError(
+                    f"第 {data_line} 行：撤回行不填含量，四项元素列必须留空"
+                )
+            values: tuple[Fraction, ...] | None = None
+        else:
+            values = tuple(
+                parse_content(value, line_no=data_line, column=elements[index])
+                for index, value in enumerate(raw_values)
+            )
+        parsed.append(
+            RetestRow(
+                sample_id=sample_id,
+                revision=revision,
+                status=status,
+                values=values,
+                line_no=data_line,
+            )
+        )
+
+    return RetestInput(elements=elements, rows=tuple(parsed))

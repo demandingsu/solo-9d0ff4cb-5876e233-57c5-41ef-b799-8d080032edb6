@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
@@ -21,14 +21,23 @@ from starlette.concurrency import run_in_threadpool
 
 from . import formatting
 from .compute import ComputeError, compute_report
-from .db import ReportRecord, Store, StoreError, VersionedInput
+from .db import ReportRecord, ReviewState, Store, StoreError, VersionedInput
 from .inputs import (
     MAX_UPLOAD_BYTES,
     BaselineInput,
     InputValidationError,
     SamplesInput,
     parse_baseline,
+    parse_retests,
     parse_samples,
+)
+from .retests import (
+    RetestConflictError,
+    RetestError,
+    RetestStaleVersionError,
+    align_retests,
+    build_sample_views,
+    view_to_payload,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -118,15 +127,90 @@ def create_app(database_path: str | None = None) -> FastAPI:
             "hidden_rows": max(0, len(rows) - len(visible)),
         }
 
+    def retest_review(state: ReviewState) -> dict[str, Any] | None:
+        """Per-sample original / effective retest / difference view.
+
+        The review is always built from the *current* samples version, so
+        retests bound to an older samples input can never appear here.  A
+        published report can only be blamed on a retest when it refers to
+        that same samples version; otherwise the page says the difference
+        cannot be attributed to this correction.
+        """
+
+        samples_input = state.samples
+        if samples_input is None:
+            return None
+        parsed = SamplesInput.from_payload(samples_input.payload)
+        views = build_sample_views(
+            parsed,
+            state.revisions,
+            samples_version=samples_input.version_id,
+        )
+        report = state.report
+        report_on_version = (
+            report is not None
+            and report.samples_version == samples_input.version_id
+        )
+        rows = []
+        for view in views:
+            entry = {
+                "sample_id": view.sample_id,
+                "original": [
+                    formatting.decimal(value, 8) for value in view.original
+                ],
+                "effective": (
+                    None
+                    if view.effective_values is None
+                    else [
+                        formatting.decimal(value, 8)
+                        for value in view.effective_values
+                    ]
+                ),
+                "differences": (
+                    None
+                    if view.differences is None
+                    else [
+                        formatting.signed(value, 8) for value in view.differences
+                    ]
+                ),
+                "latest_revision": view.latest_revision,
+                "latest_status": view.latest_status,
+                "withdrawn": view.is_withdrawn,
+                "correction": view.effective_values is not None,
+                "changed": view.changed,
+                # Only a report computed from this exact samples version
+                # may have the change attributed to the retest.
+                "needs_review": view.changed and report_on_version,
+            }
+            rows.append(entry)
+        changed = [row for row in rows if row["changed"]]
+        return {
+            "samples_version": samples_input.version_id,
+            "filename": samples_input.filename,
+            "elements": list(parsed.elements),
+            "rows": rows,
+            "corrected_count": sum(1 for row in rows if row["correction"]),
+            "withdrawn_count": sum(1 for row in rows if row["withdrawn"]),
+            "changed_count": len(changed),
+            "needs_review_count": sum(
+                1 for row in rows if row["needs_review"]
+            ),
+            "report_version": report.samples_version if report else None,
+            "report_on_same_version": report_on_version,
+            "report_available": report is not None,
+            "other_version_revisions": state.other_version_revisions,
+        }
+
     def context(request: Request) -> dict[str, Any]:
-        current = store.current_inputs()
-        record = store.latest_report()
+        state = store.review_state()
+        current = state.current
         return {
             "request": request,
             "current": {
                 kind: input_summary(value) for kind, value in current.items()
             },
-            "report": report_view(record),
+            "report": report_view(state.report),
+            "retests": retest_review(state),
             "notice": request.query_params.get("notice"),
             "notice_kind": request.query_params.get("notice_kind", "ok"),
             "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
@@ -207,6 +291,111 @@ def create_app(database_path: str | None = None) -> FastAPI:
         )
 
     def _render_with_error(request: Request, message: str) -> HTMLResponse:
+        ctx = context(request)
+        ctx["notice"] = message
+        ctx["notice_kind"] = "error"
+        return templates.TemplateResponse(
+            request, "index.html", ctx, status_code=400
+        )
+
+    @app.post("/retests/upload")
+    async def upload_retests(
+        request: Request,
+        retest_file: UploadFile | None = File(None),
+        samples_version: str | None = Form(None),
+    ) -> Response:
+        if retest_file is None or not retest_file.filename:
+            return redirect_notice(
+                "请选择复测订正 CSV 再上传。", "error", "retests"
+            )
+
+        raw = await retest_file.read(MAX_UPLOAD_BYTES + 1)
+        if len(raw) > MAX_UPLOAD_BYTES:
+            return _render_retest_error(
+                request,
+                f"复测文件超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MB 上限，"
+                "整批未接收。",
+            )
+        try:
+            parsed = await run_in_threadpool(parse_retests, raw)
+        except InputValidationError as exc:
+            return _render_retest_error(
+                request, f"复测文件：{exc}。整批未接收。"
+            )
+
+        # Bind the batch to the samples version shown when the form was
+        # rendered (submitted with the file).  A version mismatch means the
+        # samples input was replaced while the clerk was preparing the
+        # upload, so the correction must fail as a whole rather than being
+        # silently applied to a different set of samples.  apply_retests
+        # re-checks this binding inside its write transaction too.
+        state = await run_in_threadpool(store.review_state)
+        samples_value = state.samples
+        if samples_value is None:
+            return _render_retest_error(
+                request, "尚无成品输入，复测无法绑定版本。整批未接收。"
+            )
+        if samples_version is not None and samples_version.strip():
+            if not samples_version.strip().isdigit():
+                return _render_retest_error(
+                    request, "复测提交的成品版本号无效。整批未接收。"
+                )
+            if int(samples_version.strip()) != samples_value.version_id:
+                return _render_retest_error(
+                    request,
+                    f"复测提交绑定成品 v{samples_version.strip()}，"
+                    f"但当前成品已是 v{samples_value.version_id}"
+                    "（上传期间成品输入已被替换）。本次订正整批拒绝，"
+                    "此前有效的复测记录保持不变；请刷新页面后重新提交。",
+                )
+        samples = SamplesInput.from_payload(samples_value.payload)
+        try:
+            rows = await run_in_threadpool(
+                align_retests, parsed, samples, samples_value.version_id
+            )
+        except RetestError as exc:
+            return _render_retest_error(
+                request, f"{exc}。整批未接收。"
+            )
+
+        filename = (
+            retest_file.filename.replace("\\", "/").rsplit("/", 1)[-1][:200]
+            or "未命名.csv"
+        )
+        try:
+            result = await run_in_threadpool(
+                store.apply_retests, samples_value.version_id, rows, filename
+            )
+        except RetestConflictError as exc:
+            return _render_retest_error(
+                request, f"{exc}。整批拒收，此前有效的复测记录保持不变。"
+            )
+        except RetestStaleVersionError as exc:
+            return _render_retest_error(request, str(exc))
+        except StoreError as exc:
+            return _render_retest_error(
+                request,
+                f"复测写入失败，整批未生效：{exc}。此前有效的复测记录保持不变。",
+            )
+
+        if result.applied == 0:
+            message = (
+                f"本次 {result.replayed} 行与已有修订内容完全一致，"
+                "均为重复提交，未重复生效。"
+            )
+        else:
+            message = (
+                f"复测订正已生效：{result.applied} 行新修订"
+                + (
+                    f"，{result.replayed} 行重复提交未重复生效"
+                    if result.replayed
+                    else ""
+                )
+                + f"；绑定成品 v{result.samples_version}。"
+            )
+        return redirect_notice(message, "ok", "retests")
+
+    def _render_retest_error(request: Request, message: str) -> HTMLResponse:
         ctx = context(request)
         ctx["notice"] = message
         ctx["notice_kind"] = "error"
@@ -376,12 +565,39 @@ def create_app(database_path: str | None = None) -> FastAPI:
 
     @app.get("/api/latest")
     def api_latest() -> JSONResponse:
-        record = store.latest_report()
-        current = store.current_inputs()
+        state = store.review_state()
+        record = state.report
+        current = state.current
+        retests: dict[str, Any] | None = None
+        if state.samples is not None:
+            samples = SamplesInput.from_payload(state.samples.payload)
+            views = build_sample_views(
+                samples,
+                state.revisions,
+                samples_version=state.samples.version_id,
+            )
+            report_on_same_version = bool(
+                record
+                and record.samples_version == state.samples.version_id
+            )
+            retests = {
+                "samples_version": state.samples.version_id,
+                "report_version": record.samples_version if record else None,
+                "report_on_same_version": report_on_same_version,
+                "rows": [
+                    view_to_payload(
+                        view,
+                        state.samples.version_id,
+                        report_on_same_version=report_on_same_version,
+                    )
+                    for view in views
+                ],
+            }
         if record is None:
             return JSONResponse(
                 {
                     "report": None,
+                    "retests": retests,
                     "inputs": {
                         kind: (
                             {
@@ -405,8 +621,72 @@ def create_app(database_path: str | None = None) -> FastAPI:
                     "samples_version": record.samples_version,
                     "stale": record.is_stale,
                     "payload": record.payload,
-                }
+                },
+                "retests": retests,
             }
+        )
+
+    @app.get("/retests/export.csv")
+    def export_retests() -> Response:
+        state = store.review_state()
+        if state.samples is None:
+            return PlainTextResponse("成品输入尚未上传", status_code=404)
+        samples = SamplesInput.from_payload(state.samples.payload)
+        views = build_sample_views(
+            samples,
+            state.revisions,
+            samples_version=state.samples.version_id,
+        )
+        header = [
+            "sample_id",
+            "samples_version",
+            "report_version",
+            "report_on_same_version",
+            "latest_revision",
+            "latest_status",
+            "changed",
+            "needs_review",
+            *[f"original_{e}" for e in samples.elements],
+            *[f"effective_{e}" for e in samples.elements],
+            *[f"difference_{e}" for e in samples.elements],
+        ]
+
+        def cells(values):
+            if values is None:
+                return [""] * len(samples.elements)
+            return [formatting.decimal(value, 12) for value in values]
+
+        report = state.report
+        report_on_same_version = bool(
+            report is not None
+            and report.samples_version == state.samples.version_id
+        )
+        lines = [",".join(_csv_cell(cell) for cell in header)]
+        for view in views:
+            row = [
+                view.sample_id,
+                str(state.samples.version_id),
+                "" if report is None else str(report.samples_version),
+                "yes" if report_on_same_version else "no",
+                "" if view.latest_revision is None else str(view.latest_revision),
+                view.latest_status or "",
+                "yes" if view.changed else "no",
+                "yes"
+                if view.changed and report_on_same_version
+                else "no",
+                *cells(view.original),
+                *cells(view.effective_values),
+                *cells(view.differences),
+            ]
+            lines.append(",".join(_csv_cell(cell) for cell in row))
+        return Response(
+            "﻿" + "\r\n".join(lines) + "\r\n",
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="retests-v{state.samples.version_id}.csv"'
+                )
+            },
         )
 
     return app
